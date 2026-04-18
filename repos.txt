@@ -1,0 +1,5 @@
+https://github.com/cybersecurity-dev/awesome-yara
+https://github.com/inquest/awesome-yara
+https://github.com/Neo23x0/signature-base
+https://github.com/Yara-Rules/rules
+https://github.com/roadwy/DefenderYara
