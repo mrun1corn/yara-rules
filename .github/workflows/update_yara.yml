@@ -27,7 +27,7 @@ jobs:
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "Automated YARA rules update [skip ci]"
-          file_pattern: 'Organized_YARA/ seen_hashes.json yara_structure_mapping.json'
+          file_pattern: 'Organized_YARA/ seen_hashes.json yara_structure_mapping.json yara_path_mapping.json all_rules.csv all_yara_paths.txt'
           commit_user_name: "github-actions[bot]"
           commit_user_email: "github-actions[bot]@users.noreply.github.com"
           commit_author: "github-actions[bot] <github-actions[bot]@users.noreply.github.com>"

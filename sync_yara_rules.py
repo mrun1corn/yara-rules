@@ -14,6 +14,9 @@ SOURCE_DIR = "source_repos"
 OUTPUT_DIR = "Organized_YARA"
 HASH_DB = "seen_hashes.json"
 MAPPING_JSON = "yara_structure_mapping.json"
+PATH_MAPPING_JSON = "yara_path_mapping.json"
+ALL_RULES_CSV = "all_rules.csv"
+ALL_PATHS_TXT = "all_yara_paths.txt"
 
 def get_repos():
     if not os.path.exists(REPO_FILE):
@@ -198,21 +201,40 @@ def main():
     with open(HASH_DB, "w") as f:
         json.dump(seen_hashes, f, indent=4)
 
-    print("Updating mapping index...")
+    print("Updating mapping indexes...")
     final_structure = {}
+    path_structure = {}
     for cat_dir in sorted(Path(OUTPUT_DIR).iterdir()):
         if cat_dir.is_dir() and cat_dir.name in CATEGORIES:
             cat_name = cat_dir.name
             final_structure[cat_name] = {}
+            path_structure[cat_name] = {}
             for sub_dir in sorted(cat_dir.iterdir()):
                 if sub_dir.is_dir():
                     sub_name = sub_dir.name
-                    files = [f.name for f in sub_dir.glob("*.yar*")]
+                    files = sorted(list(sub_dir.glob("*.yar*")))
                     if files:
-                        final_structure[cat_name][sub_name] = sorted(files)
+                        final_structure[cat_name][sub_name] = [f.name for f in files]
+                        path_structure[cat_name][sub_name] = [f.as_posix() for f in files]
 
     with open(MAPPING_JSON, "w") as f:
         json.dump(final_structure, f, indent=4)
+    with open(PATH_MAPPING_JSON, "w") as f:
+        json.dump(path_structure, f, indent=4)
+
+    # STEP 5: Generate Path Indexes
+    print("Generating path indexes...")
+    with open(ALL_RULES_CSV, "w") as csv_f, open(ALL_PATHS_TXT, "w") as txt_f:
+        csv_f.write('"Name","Length","FullName"\n')
+        for root, _, files in os.walk(OUTPUT_DIR):
+            for file in files:
+                if file.endswith(".yar") or file.endswith(".yara"):
+                    file_path = Path(root) / file
+                    size = file_path.stat().st_size
+                    # Write to CSV
+                    csv_f.write(f'"{file}","{size}","{file_path.absolute().as_posix()}"\n')
+                    # Write to TXT
+                    txt_f.write(f"{file_path.absolute().as_posix()}\n")
 
     print(f"Sync complete. Added {new_files_count} new unique rules.")
 
