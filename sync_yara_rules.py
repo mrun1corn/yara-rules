@@ -7,6 +7,8 @@ from pathlib import Path
 
 # --- Configuration ---
 REPO_FILE = "repos.txt"
+CATEGORY_FILE = "catagory.txt"
+SUB_CATEGORY_FILE = "sub_catagory.txt"
 SOURCE_DIR = "source_repos"
 OUTPUT_DIR = "Organized_YARA"
 HASH_DB = "seen_hashes.json"
@@ -18,18 +20,34 @@ def get_repos():
     with open(REPO_FILE, "r") as f:
         return [line.strip() for line in f if line.strip() and not line.startswith("#")]
 
-CATEGORIES = [
-    'sql_injection', 'scripting_attacks', 'brute_force', 'credential_theft', 
-    'phishing', 'behavioral', 'rootkit', 'malware', 'trojans', 
-    'ransomware', 'spyware', 'worms', 'autorun', 'security'
-]
+def get_authorized_categories():
+    if not os.path.exists(CATEGORY_FILE):
+        return ['malware']
+    cats = []
+    with open(CATEGORY_FILE, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("=") or line.startswith("http"):
+                continue
+            # Extract just the category name before any notes like (monitor...)
+            cat_name = re.split(r"[\s\(]", line)[0].lower()
+            if cat_name:
+                cats.append(cat_name)
+    return list(set(cats))
 
-SUB_CATEGORIES = [
-    'AMSI_Bypass', 'Banking_Trojans', 'Crypto_Ransomware', 'Downloaders_Droppers', 
-    'Evasion_Sandbox', 'Infostealers', 'Injection_Techniques', 'Keyloggers', 
-    'Persistence_Methods', 'Phishing_Lures', 'PowerShell_Abuse', 'RATs', 
-    'Rootkits_Kernel', 'SQL_Brute_Force'
-]
+def get_authorized_sub_categories():
+    if not os.path.exists(SUB_CATEGORY_FILE):
+        return []
+    subs = []
+    with open(SUB_CATEGORY_FILE, "r") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                subs.append(line)
+    return subs
+
+CATEGORIES = get_authorized_categories()
+SUB_CATEGORIES = get_authorized_sub_categories()
 
 def get_md5(file_path):
     hash_md5 = hashlib.md5()
@@ -38,41 +56,74 @@ def get_md5(file_path):
             hash_md5.update(chunk)
     return hash_md5.hexdigest()
 
+import re
+
+def get_content_info(file_path):
+    """
+    Reads the YARA file to extract the rule name and meta description.
+    """
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read(2000) # Read the first 2000 chars (usually enough for header/meta)
+            
+            # Extract rule name(s)
+            rule_names = re.findall(r"rule\s+([\w\d_]+)", content)
+            # Extract description from meta
+            meta_desc = re.search(r"description\s*=\s*\"([^\"]+)\"", content)
+            
+            combined_info = " ".join(rule_names).lower()
+            if meta_desc:
+                combined_info += " " + meta_desc.group(1).lower()
+            
+            return combined_info
+    except:
+        return ""
+
 def get_category_info(file_path, repo_root):
-    """
-    Dynamically identifies category and sub-category based on the file's path 
-    relative to the repository root.
-    """
-    path_parts = file_path.relative_to(repo_root).parts
+    path_str = str(file_path).lower()
     filename = file_path.name.lower()
+    content_info = get_content_info(file_path)
     
-    # Defaults
+    # Combined signal for better detection
+    signal = f"{path_str} {filename} {content_info}"
+
     found_cat = "malware"
     found_sub = "General"
 
-    # Strategy 1: Use the folder structure of the source repo
-    # If the file is in repo/category/subcat/file.yar
-    if len(path_parts) >= 3:
-        found_cat = path_parts[0].lower()
-        found_sub = path_parts[1]
-    # If the file is in repo/category/file.yar
-    elif len(path_parts) == 2:
-        found_cat = path_parts[0].lower()
-        
-    # Strategy 2: Refine using keywords if we are still at 'malware' default
-    if found_cat == "malware":
-        for cat in CATEGORIES:
-            if cat in str(file_path).lower() or filename.startswith(cat + "_"):
-                found_cat = cat
-                break
-
+    # 1. Try technical sub-categories first (most specific)
     for sub in SUB_CATEGORIES:
-        if sub.lower() in str(file_path).lower():
+        if sub.lower() in signal:
             found_sub = sub
             break
             
-    # Clean up names (remove underscores, etc. if desired, or keep as is)
-    found_cat = found_cat.replace(" ", "_").replace("-", "_")
+    # 2. Identify main category
+    # Priority mapping: Rule Header > Meta Description > Path
+    if "ransom" in signal: found_cat = "ransomware"
+    elif "trojan" in signal: found_cat = "trojans"
+    elif "spyware" in signal or "stealer" in signal: found_cat = "spyware"
+    elif "worm" in signal: found_cat = "worms"
+    elif "rootkit" in signal: found_cat = "rootkit"
+    elif "phish" in signal: found_cat = "phishing"
+    elif "exploit" in signal or "cve" in signal: found_cat = "scripting_attacks"
+    elif "brute" in signal: found_cat = "brute_force"
+    elif "bypass" in signal: found_cat = "security"
+    else:
+        # Fallback to original path-based discovery if keywords fail
+        path_parts = file_path.relative_to(repo_root).parts
+        if len(path_parts) >= 2:
+            found_cat = path_parts[0].lower()
+            
+    # Clean up names
+    # Remove symbols like #, @, !, etc.
+    found_cat = re.sub(r"[^a-zA-Z0-9_]", "", found_cat.replace(" ", "_").replace("-", "_")).lower()
+    found_sub = re.sub(r"[^a-zA-Z0-9_]", "", found_sub.replace(" ", "_").replace("-", "_"))
+
+    # Mapping common abbreviations to cleaner names
+    clean_map = {
+        "pua": "potentially_unwanted_apps",
+        "apt": "advanced_persistent_threats"
+    }
+    found_cat = clean_map.get(found_cat, found_cat)
     
     return found_cat, found_sub
 

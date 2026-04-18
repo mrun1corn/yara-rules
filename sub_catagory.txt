@@ -1,0 +1,17 @@
+AMSI_Bypass
+Banking_Trojans
+Crypto_Ransomware
+Downloaders_Droppers
+Evasion_Sandbox
+Infostealers
+Injection_Techniques
+Keyloggers
+Persistence_Methods
+Phishing_Lures
+PowerShell_Abuse
+RATs
+Rootkits_Kernel
+SQL_Brute_Force
+CoinMiner
+Shellcode
+Macros

@@ -11,18 +11,4 @@ ransomware
 spyware
 worms
 autorun
-security (monitor, rescan, scan this kind of attack)
-
-
-collected all the files from those links
-==================================================
-https://github.com/cybersecurity-dev/awesome-yara
-https://github.com/inquest/awesome-yara
-https://github.com/Neo23x0/signature-base
-https://github.com/Yara-Rules/rules
-https://github.com/roadwy/DefenderYara
-==================================================
-
-
-all are sorted out mostly according to the required YARA.
-some YARA may missing due to windows defender action
+security
