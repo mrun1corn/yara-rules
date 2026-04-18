@@ -127,6 +127,25 @@ def get_category_info(file_path, repo_root):
             
     return found_cat, found_sub
 
+def sync_repos():
+    if not os.path.exists(SOURCE_DIR):
+        os.makedirs(SOURCE_DIR)
+    
+    repos = get_repos()
+    sync_results = []
+    for repo_url in repos:
+        repo_name = repo_url.split("/")[-1]
+        target_path = os.path.join(SOURCE_DIR, repo_name)
+        
+        if os.path.exists(target_path):
+            print(f"Updating {repo_name}...")
+            subprocess.run(["git", "-C", target_path, "pull"], capture_output=True)
+        else:
+            print(f"Cloning {repo_name}...")
+            subprocess.run(["git", "clone", "--depth", "1", repo_url, target_path], capture_output=True)
+        sync_results.append((repo_name, Path(target_path)))
+    return sync_results
+
 def main():
     # Load seen hashes
     seen_hashes = {}
