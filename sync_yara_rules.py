@@ -88,7 +88,7 @@ def get_category_info(file_path, repo_root):
     # Combined signal for better detection
     signal = f"{path_str} {filename} {content_info}"
 
-    found_cat = "malware"
+    found_cat = None
     found_sub = "General"
 
     # 1. Try technical sub-categories first (most specific)
@@ -97,8 +97,7 @@ def get_category_info(file_path, repo_root):
             found_sub = sub
             break
             
-    # 2. Identify main category
-    # Priority mapping: Rule Header > Meta Description > Path
+    # 2. Strict Category Mapping (Mapping everything to your 14 authorized buckets)
     if "ransom" in signal: found_cat = "ransomware"
     elif "trojan" in signal: found_cat = "trojans"
     elif "spyware" in signal or "stealer" in signal: found_cat = "spyware"
@@ -108,44 +107,25 @@ def get_category_info(file_path, repo_root):
     elif "exploit" in signal or "cve" in signal: found_cat = "scripting_attacks"
     elif "brute" in signal: found_cat = "brute_force"
     elif "bypass" in signal: found_cat = "security"
-    else:
-        # Fallback to original path-based discovery if keywords fail
+    elif "autorun" in signal: found_cat = "autorun"
+    elif "sql" in signal or "inject" in signal: found_cat = "sql_injection"
+    elif "behavi" in signal or "evas" in signal: found_cat = "behavioral"
+    elif "credential" in signal: found_cat = "credential_theft"
+    
+    # 3. Fallback to path-based but ONLY if it matches an authorized category
+    if not found_cat:
         path_parts = file_path.relative_to(repo_root).parts
-        if len(path_parts) >= 2:
-            found_cat = path_parts[0].lower()
+        for part in path_parts:
+            part_clean = re.sub(r"[^a-zA-Z0-9_]", "", part.lower())
+            if part_clean in CATEGORIES:
+                found_cat = part_clean
+                break
+
+    # 4. Final bucket: Everything else goes to 'malware'
+    if not found_cat or found_cat not in CATEGORIES:
+        found_cat = "malware"
             
-    # Clean up names
-    # Remove symbols like #, @, !, etc.
-    found_cat = re.sub(r"[^a-zA-Z0-9_]", "", found_cat.replace(" ", "_").replace("-", "_")).lower()
-    found_sub = re.sub(r"[^a-zA-Z0-9_]", "", found_sub.replace(" ", "_").replace("-", "_"))
-
-    # Mapping common abbreviations to cleaner names
-    clean_map = {
-        "pua": "potentially_unwanted_apps",
-        "apt": "advanced_persistent_threats"
-    }
-    found_cat = clean_map.get(found_cat, found_cat)
-    
     return found_cat, found_sub
-
-def sync_repos():
-    if not os.path.exists(SOURCE_DIR):
-        os.makedirs(SOURCE_DIR)
-    
-    repos = get_repos()
-    sync_results = []
-    for repo_url in repos:
-        repo_name = repo_url.split("/")[-1]
-        target_path = os.path.join(SOURCE_DIR, repo_name)
-        
-        if os.path.exists(target_path):
-            print(f"Updating {repo_name}...")
-            subprocess.run(["git", "-C", target_path, "pull"], capture_output=True)
-        else:
-            print(f"Cloning {repo_name}...")
-            subprocess.run(["git", "clone", "--depth", "1", repo_url, target_path], capture_output=True)
-        sync_results.append((repo_name, Path(target_path)))
-    return sync_results
 
 def main():
     # Load seen hashes
@@ -154,11 +134,12 @@ def main():
         with open(HASH_DB, "r") as f:
             seen_hashes = json.load(f)
 
+    # STEP 1: Sync all repos first
     repo_info = sync_repos()
     
+    # STEP 2: Process rules
     new_files_count = 0
     print("Processing YARA rules...")
-    
     for repo_name, repo_root in repo_info:
         for root, _, files in os.walk(repo_root):
             for file in files:
@@ -166,57 +147,55 @@ def main():
                     file_path = Path(root) / file
                     try:
                         file_hash = get_md5(file_path)
-                        
-                        # Fix: Standardize path to forward slashes for the DB
-                        if file_hash in seen_hashes:
-                            existing_path = Path(seen_hashes[file_hash])
-                            if existing_path.exists():
-                                continue 
+                        if file_hash in seen_hashes and Path(seen_hashes[file_hash]).exists():
+                            continue 
                         
                         cat, sub = get_category_info(file_path, repo_root)
                         target_dir = Path(OUTPUT_DIR) / cat / sub
                         target_dir.mkdir(parents=True, exist_ok=True)
                         
                         target_file = target_dir / file
-                        
-                        # Handle name collisions
                         if target_file.exists():
-                            # If it's the same hash already at this exact location, skip
                             if get_md5(target_file) == file_hash:
-                                seen_hashes[file_hash] = target_file.as_posix()
                                 continue
                             target_file = target_dir / f"{target_file.stem}_{file_hash[:8]}{target_file.suffix}"
 
                         shutil.copy2(file_path, target_file)
                         new_files_count += 1
-                        # Always store as POSIX (forward slashes) in JSON
                         seen_hashes[file_hash] = target_file.as_posix()
-                            
                     except Exception as e:
                         print(f"Error processing {file_path}: {e}")
 
-    # Save hash database
+    # STEP 3: Cleanup unauthorized folders (Purge)
+    print("Cleaning up unauthorized category folders...")
+    if os.path.exists(OUTPUT_DIR):
+        for item in os.listdir(OUTPUT_DIR):
+            item_path = os.path.join(OUTPUT_DIR, item)
+            if os.path.isdir(item_path) and item.lower() not in CATEGORIES:
+                print(f"Removing unauthorized category: {item}")
+                shutil.rmtree(item_path)
+
+    # STEP 4: Save database and mapping
     with open(HASH_DB, "w") as f:
         json.dump(seen_hashes, f, indent=4)
 
-    # Rebuild mapping JSON based on current Organized_YARA content
     print("Updating mapping index...")
     final_structure = {}
-    for cat_dir in Path(OUTPUT_DIR).iterdir():
-        if cat_dir.is_dir():
+    for cat_dir in sorted(Path(OUTPUT_DIR).iterdir()):
+        if cat_dir.is_dir() and cat_dir.name in CATEGORIES:
             cat_name = cat_dir.name
             final_structure[cat_name] = {}
-            for sub_dir in cat_dir.iterdir():
+            for sub_dir in sorted(cat_dir.iterdir()):
                 if sub_dir.is_dir():
                     sub_name = sub_dir.name
                     files = [f.name for f in sub_dir.glob("*.yar*")]
-                    final_structure[cat_name][sub_name] = sorted(files)
+                    if files:
+                        final_structure[cat_name][sub_name] = sorted(files)
 
     with open(MAPPING_JSON, "w") as f:
         json.dump(final_structure, f, indent=4)
 
     print(f"Sync complete. Added {new_files_count} new unique rules.")
-    print(f"Total unique rules: {len(seen_hashes)}")
 
 if __name__ == "__main__":
     main()
