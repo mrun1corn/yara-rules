@@ -115,8 +115,11 @@ def main():
                     try:
                         file_hash = get_md5(file_path)
                         
-                        if file_hash in seen_hashes and os.path.exists(seen_hashes[file_hash]):
-                            continue 
+                        # Fix: Standardize path to forward slashes for the DB
+                        if file_hash in seen_hashes:
+                            existing_path = Path(seen_hashes[file_hash])
+                            if existing_path.exists():
+                                continue 
                         
                         cat, sub = get_category_info(file_path, repo_root)
                         target_dir = Path(OUTPUT_DIR) / cat / sub
@@ -126,11 +129,16 @@ def main():
                         
                         # Handle name collisions
                         if target_file.exists():
+                            # If it's the same hash already at this exact location, skip
+                            if get_md5(target_file) == file_hash:
+                                seen_hashes[file_hash] = target_file.as_posix()
+                                continue
                             target_file = target_dir / f"{target_file.stem}_{file_hash[:8]}{target_file.suffix}"
 
                         shutil.copy2(file_path, target_file)
                         new_files_count += 1
-                        seen_hashes[file_hash] = str(target_file)
+                        # Always store as POSIX (forward slashes) in JSON
+                        seen_hashes[file_hash] = target_file.as_posix()
                             
                     except Exception as e:
                         print(f"Error processing {file_path}: {e}")
