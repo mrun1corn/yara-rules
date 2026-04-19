@@ -32,6 +32,7 @@ jobs:
       - name: Run Sync Script
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: "gemini-2.0-flash" # Change this here if you want a different model
         run: python sync_yara_rules.py
 
       - name: Auto Commit and Push
