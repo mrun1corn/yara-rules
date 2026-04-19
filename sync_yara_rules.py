@@ -580,6 +580,29 @@ def main():
 
     purge_unknown_folders()
 
+    # Step 6: Generate CSV and Text indexes (Required for Documentation/Workflow)
+    log.info("Generating index files...")
+    all_rules_data = []
+    all_paths_data = []
+    
+    for cat_dir in Path(OUTPUT_DIR).iterdir():
+        if not cat_dir.is_dir(): continue
+        for sub_dir in cat_dir.iterdir():
+            if not sub_dir.is_dir(): continue
+            for file in sub_dir.glob("*.yar*"):
+                size = file.stat().st_size
+                # We use posix path for consistency in the index
+                rel_path = file.as_posix()
+                all_rules_data.append(f'"{file.name}","{size}","{rel_path}"')
+                all_paths_data.append(rel_path)
+
+    with open("all_rules.csv", "w", encoding="utf-8") as f:
+        f.write('"Name","Length","FullName"\n')
+        f.write("\n".join(all_rules_data))
+    
+    with open("all_yara_paths.txt", "w", encoding="utf-8") as f:
+        f.write("\n".join(all_paths_data))
+
     # Save State
     with open(HASH_DB, "w") as f: json.dump(seen_hashes, f, indent=4)
     with open(PATH_MAPPING, "w") as f: json.dump(path_mapping, f, indent=4)
