@@ -4,239 +4,498 @@ import hashlib
 import json
 import shutil
 import re
+import logging
+import sys
+import urllib.request
+import urllib.error
+import time
 from pathlib import Path
+from datetime import datetime
 
-# --- Configuration ---
-REPO_FILE = "repos.txt"
-CATEGORY_FILE = "catagory.txt"
-SUB_CATEGORY_FILE = "sub_catagory.txt"
-SOURCE_DIR = "source_repos"
-OUTPUT_DIR = "Organized_YARA"
-HASH_DB = "seen_hashes.json"
-MAPPING_JSON = "yara_structure_mapping.json"
-PATH_MAPPING_JSON = "yara_path_mapping.json"
-ALL_RULES_CSV = "all_rules.csv"
-ALL_PATHS_TXT = "all_yara_paths.txt"
+# ─────────────────────────────────────────────
+#  Optional: YARA syntax validation
+#  Install with: pip install yara-python
+# ─────────────────────────────────────────────
+try:
+    import yara
+    YARA_VALIDATION = True
+except ImportError:
+    YARA_VALIDATION = False
 
+# ══════════════════════════════════════════════
+#  ENVIRONMENT & CONFIGURATION
+# ══════════════════════════════════════════════
+def load_env(env_path=".env"):
+    """Minimal .env loader to avoid extra dependencies."""
+    if os.path.exists(env_path):
+        with open(env_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, value = line.split("=", 1)
+                    os.environ[key.strip()] = value.strip().strip('"').strip("'")
+
+load_env()
+
+REPO_FILE     = "repos.txt"
+RULES_FILE    = "rules.json"
+SOURCE_DIR    = "source_repos"
+OUTPUT_DIR    = "Organized_YARA"
+HASH_DB       = "seen_hashes.json"
+MAPPING_JSON  = "yara_structure_mapping.json"
+PATH_MAPPING  = "yara_path_mapping.json"
+AI_CACHE_FILE = "ai_category_cache.json"
+LOG_FILE      = "yara_organizer.log"
+
+USE_AI = True
+
+# Gemini free API — get your key at https://aistudio.google.com/app/apikey
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODEL   = "gemini-2.0-flash"
+GEMINI_URL     = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    "{model}:generateContent?key={key}"
+)
+
+# ══════════════════════════════════════════════
+#  LOGGING
+# ══════════════════════════════════════════════
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%H:%M:%S",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+    ],
+)
+log = logging.getLogger(__name__)
+
+
+# ══════════════════════════════════════════════
+#  LOAD TAXONOMY FROM rules.json
+#
+#  Expected structure:
+#  {
+#    "defaults": { "category": "...", "subcategory": "..." },
+#    "taxonomy": {
+#      "<category>": {
+#        "subcategories": ["Sub1", "Sub2", ...],
+#        "keywords": ["kw1", "kw2", ...]
+#      },
+#      ...
+#    }
+#  }
+# ══════════════════════════════════════════════
+def load_rules(rules_file=RULES_FILE):
+    if not os.path.exists(rules_file):
+        log.error(f"'{rules_file}' not found. Create it before running.")
+        sys.exit(1)
+
+    with open(rules_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    for key in ["defaults", "taxonomy"]:
+        if key not in data:
+            log.error(f"'{rules_file}' is missing required key: '{key}'")
+            sys.exit(1)
+
+    taxonomy = data["taxonomy"]
+
+    # Derive flat sets from the nested structure
+    valid_categories    = set(taxonomy.keys())
+    valid_subcategories = set()
+    for cat_data in taxonomy.values():
+        valid_subcategories.update(cat_data.get("subcategories", []))
+
+    # Build keyword map: (keyword, category, best_subcategory)
+    # best_subcategory = first entry in that category's subcategories list
+    keyword_map = []
+    for category, cat_data in taxonomy.items():
+        subs     = cat_data.get("subcategories", [])
+        keywords = cat_data.get("keywords", [])
+        default_sub = subs[0] if subs else data["defaults"]["subcategory"]
+        for kw in keywords:
+            keyword_map.append((kw.lower(), category, default_sub))
+
+    # Build human-readable prompt lists
+    cat_lines = []
+    for category, cat_data in sorted(taxonomy.items()):
+        subs = ", ".join(cat_data.get("subcategories", []))
+        cat_lines.append(f"  - {category}  (subcategories: {subs})")
+    prompt_taxonomy = "\n".join(cat_lines)
+
+    return {
+        "taxonomy":          taxonomy,
+        "valid_categories":  valid_categories,
+        "valid_subcategories": valid_subcategories,
+        "default_cat":       data["defaults"]["category"],
+        "default_sub":       data["defaults"]["subcategory"],
+        "keyword_map":       keyword_map,
+        "prompt_taxonomy":   prompt_taxonomy,
+    }
+
+
+# Load once at startup — all functions reference these globals
+RULES               = load_rules()
+TAXONOMY            = RULES["taxonomy"]
+VALID_CATEGORIES    = RULES["valid_categories"]
+VALID_SUBCATEGORIES = RULES["valid_subcategories"]
+DEFAULT_CATEGORY    = RULES["default_cat"]
+DEFAULT_SUBCATEGORY = RULES["default_sub"]
+KEYWORD_MAP         = RULES["keyword_map"]
+
+
+# ══════════════════════════════════════════════
+#  REPO LOADING
+# ══════════════════════════════════════════════
 def get_repos():
     if not os.path.exists(REPO_FILE):
+        log.warning(f"'{REPO_FILE}' not found — no repos to sync.")
         return []
     with open(REPO_FILE, "r") as f:
-        return [line.strip() for line in f if line.strip() and not line.startswith("#")]
+        return [l.strip() for l in f if l.strip() and not l.startswith("#")]
 
-def get_authorized_categories():
-    if not os.path.exists(CATEGORY_FILE):
-        return ['malware']
-    cats = []
-    with open(CATEGORY_FILE, "r") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("=") or line.startswith("http"):
-                continue
-            # Extract just the category name before any notes like (monitor...)
-            cat_name = re.split(r"[\s\(]", line)[0].lower()
-            if cat_name:
-                cats.append(cat_name)
-    return list(set(cats))
 
-def get_authorized_sub_categories():
-    if not os.path.exists(SUB_CATEGORY_FILE):
-        return []
-    subs = []
-    with open(SUB_CATEGORY_FILE, "r") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                subs.append(line)
-    return subs
-
-CATEGORIES = get_authorized_categories()
-SUB_CATEGORIES = get_authorized_sub_categories()
-
+# ══════════════════════════════════════════════
+#  HASHING
+# ══════════════════════════════════════════════
 def get_md5(file_path):
-    hash_md5 = hashlib.md5()
+    h = hashlib.md5()
     with open(file_path, "rb") as f:
         for chunk in iter(lambda: f.read(4096), b""):
-            hash_md5.update(chunk)
-    return hash_md5.hexdigest()
+            h.update(chunk)
+    return h.hexdigest()
 
-import re
 
-def get_content_info(file_path):
-    """
-    Reads the YARA file to extract the rule name and meta description.
-    """
+# ══════════════════════════════════════════════
+#  YARA HEADER EXTRACTION
+# ══════════════════════════════════════════════
+def extract_yara_header(file_path, char_limit=3000):
+    """Extracts rule names + meta fields from the top of a YARA file."""
     try:
         with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-            content = f.read(2000) # Read the first 2000 chars (usually enough for header/meta)
-            
-            # Extract rule name(s)
-            rule_names = re.findall(r"rule\s+([\w\d_]+)", content)
-            # Extract description from meta
-            meta_desc = re.search(r"description\s*=\s*\"([^\"]+)\"", content)
-            
-            combined_info = " ".join(rule_names).lower()
-            if meta_desc:
-                combined_info += " " + meta_desc.group(1).lower()
-            
-            return combined_info
-    except:
+            content = f.read(char_limit)
+        rule_names  = re.findall(r"rule\s+([\w\d_]+)", content)
+        meta_fields = re.findall(
+            r'(?:description|author|reference|family|tags?)\s*=\s*"([^"]+)"',
+            content, re.IGNORECASE
+        )
+        return " | ".join(rule_names + meta_fields)
+    except Exception:
         return ""
 
-def get_category_info(file_path, repo_root):
-    path_str = str(file_path).lower()
-    filename = file_path.name.lower()
-    content_info = get_content_info(file_path)
+
+# ══════════════════════════════════════════════
+#  YARA SYNTAX VALIDATION
+# ══════════════════════════════════════════════
+def validate_yara(file_path):
+    if not YARA_VALIDATION:
+        return True, ""
+    try:
+        yara.compile(filepath=str(file_path))
+        return True, ""
+    except yara.SyntaxError as e:
+        return False, str(e)
+    except Exception as e:
+        return False, str(e)
+
+
+# ══════════════════════════════════════════════
+#  GEMINI API CALL  (pure stdlib — no SDK)
+# ══════════════════════════════════════════════
+def call_gemini(prompt):
+    url = GEMINI_URL.format(model=GEMINI_MODEL, key=GEMINI_API_KEY)
+    payload = json.dumps({
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature":     0.1,
+            "maxOutputTokens": 150,
+        },
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        url, data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+
+    return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+
+# ══════════════════════════════════════════════
+#  AI CATEGORIZATION (Batch)
+# ══════════════════════════════════════════════
+def batch_ai_categorize(headers_to_classify, cache):
+    """
+    Classifies YARA rules in batches of 20 to optimize API usage and speed.
+    """
+    results = {}
     
-    # Combined signal for better detection
-    signal = f"{path_str} {filename} {content_info}"
-
-    found_cat = None
-    found_sub = "General"
-
-    # 1. Try technical sub-categories first (most specific)
-    for sub in SUB_CATEGORIES:
-        if sub.lower() in signal:
-            found_sub = sub
-            break
-            
-    # 2. Strict Category Mapping (Mapping everything to your 14 authorized buckets)
-    if "ransom" in signal: found_cat = "ransomware"
-    elif "trojan" in signal: found_cat = "trojans"
-    elif "spyware" in signal or "stealer" in signal: found_cat = "spyware"
-    elif "worm" in signal: found_cat = "worms"
-    elif "rootkit" in signal: found_cat = "rootkit"
-    elif "phish" in signal: found_cat = "phishing"
-    elif "exploit" in signal or "cve" in signal: found_cat = "scripting_attacks"
-    elif "brute" in signal: found_cat = "brute_force"
-    elif "bypass" in signal: found_cat = "security"
-    elif "autorun" in signal: found_cat = "autorun"
-    elif "sql" in signal or "inject" in signal: found_cat = "sql_injection"
-    elif "behavi" in signal or "evas" in signal: found_cat = "behavioral"
-    elif "credential" in signal: found_cat = "credential_theft"
-    
-    # 3. Fallback to path-based but ONLY if it matches an authorized category
-    if not found_cat:
-        path_parts = file_path.relative_to(repo_root).parts
-        for part in path_parts:
-            part_clean = re.sub(r"[^a-zA-Z0-9_]", "", part.lower())
-            if part_clean in CATEGORIES:
-                found_cat = part_clean
-                break
-
-    # 4. Final bucket: Everything else goes to 'malware'
-    if not found_cat or found_cat not in CATEGORIES:
-        found_cat = "malware"
-            
-    return found_cat, found_sub
-
-def sync_repos():
-    if not os.path.exists(SOURCE_DIR):
-        os.makedirs(SOURCE_DIR)
-    
-    repos = get_repos()
-    sync_results = []
-    for repo_url in repos:
-        repo_name = repo_url.split("/")[-1]
-        target_path = os.path.join(SOURCE_DIR, repo_name)
-        
-        if os.path.exists(target_path):
-            print(f"Updating {repo_name}...")
-            subprocess.run(["git", "-C", target_path, "pull"], capture_output=True)
+    # 1. Filter out already cached items
+    to_process = []
+    for item_id, header in headers_to_classify:
+        cache_key = hashlib.md5(header.encode()).hexdigest()
+        if cache_key in cache:
+            results[item_id] = cache[cache_key]
         else:
-            print(f"Cloning {repo_name}...")
-            subprocess.run(["git", "clone", "--depth", "1", repo_url, target_path], capture_output=True)
-        sync_results.append((repo_name, Path(target_path)))
-    return sync_results
+            to_process.append((item_id, header, cache_key))
+            
+    if not to_process:
+        return results
 
+    log.info(f"  Sending {len(to_process)} rules to Gemini in batches...")
+    
+    # 2. Process in batches of 20
+    batch_size = 20
+    for i in range(0, len(to_process), batch_size):
+        batch = to_process[i:i + batch_size]
+        
+        items_json = []
+        for idx, (item_id, header, _) in enumerate(batch):
+            items_json.append({"id": idx, "header": header})
+
+        prompt = f"""You are a cybersecurity expert specializing in YARA rule classification.
+Classify each of the {len(batch)} YARA rule headers provided below into a category and subcategory from the allowed taxonomy.
+
+--- Taxonomy (category -> allowed subcategories) ---
+{RULES['prompt_taxonomy']}
+
+--- Rules to Classify ---
+{json.dumps(items_json, indent=2)}
+
+--- Classification Guide ---
+- Keylogger rules             -> spyware -> Keyloggers
+- PowerShell attacks           -> scripting_attacks -> PowerShell_Abuse
+- Banking trojans              -> trojans -> Banking_Trojans
+- AMSI / AV bypass             -> security -> AMSI_Bypass
+- File-encrypting ransomware   -> ransomware -> Crypto_Ransomware
+- Rootkit / kernel drivers     -> rootkit -> Rootkits_Kernel
+- SQL injection patterns        -> sql_injection -> SQL_Brute_Force
+- Phishing documents / lures   -> phishing -> Phishing_Lures
+- Office macros / VBA           -> malware -> Macros
+- Shellcode / process injection -> scripting_attacks -> Shellcode
+- Coin / crypto miners          -> malware -> CoinMiner
+- Sandbox / VM evasion          -> behavioral -> Evasion_Sandbox
+- Droppers / loaders            -> malware -> Downloaders_Droppers
+- RATs / remote access          -> trojans -> RATs
+- Credential dumping            -> credential_theft -> Infostealers
+- Persistence / autorun         -> autorun -> Persistence_Methods
+- If uncertain                  -> {DEFAULT_CATEGORY} -> {DEFAULT_SUBCATEGORY}
+
+Respond ONLY with a JSON array of objects.
+[{{ "id": 0, "category": "category_name", "subcategory": "subcategory_name" }}, ...]"""
+
+        try:
+            raw = call_gemini(prompt)
+            raw = re.sub(r"```[a-z]*", "", raw).strip("` \n")
+            
+            # Find the JSON array in the response
+            array_match = re.search(r'\[.*\]', raw, re.DOTALL)
+            if not array_match:
+                raise ValueError("No JSON array found in Gemini response.")
+            
+            batch_results = json.loads(array_match.group())
+            
+            # Map results back to items
+            for res in batch_results:
+                b_idx = res.get("id")
+                if b_idx is not None and b_idx < len(batch):
+                    item_id, _, cache_key = batch[b_idx]
+                    category = res.get("category", DEFAULT_CATEGORY)
+                    subcategory = res.get("subcategory", DEFAULT_SUBCATEGORY)
+                    
+                    # Validate against taxonomy
+                    if category not in VALID_CATEGORIES:
+                        category = DEFAULT_CATEGORY
+                    allowed_subs = set(TAXONOMY[category].get("subcategories", []))
+                    if subcategory not in allowed_subs:
+                        subcategory = TAXONOMY[category]["subcategories"][0] if allowed_subs else DEFAULT_SUBCATEGORY
+                    
+                    res_obj = {"category": category, "subcategory": subcategory}
+                    results[item_id] = res_obj
+                    cache[cache_key] = res_obj
+                    
+            # Rate limiting for Free Tier (15 RPM)
+            if i + batch_size < len(to_process):
+                log.info("  Waiting for RPM limit safety (4s)...")
+                time.sleep(4)
+
+        except Exception as e:
+            log.warning(f"  Batch AI failed: {e}. Items will use keyword fallback.")
+            # Remaining items in this batch will be missing from 'results' and fallback later
+
+    return results
+
+
+# ══════════════════════════════════════════════
+#  FALLBACK: KEYWORD CATEGORIZATION (Weighted)
+# ══════════════════════════════════════════════
+def keyword_categorize(file_path, repo_root):
+    header   = extract_yara_header(file_path)
+    path_str = str(file_path).lower()
+    signal   = f"{path_str} {header.lower()}"
+
+    best_cat, best_sub = DEFAULT_CATEGORY, DEFAULT_SUBCATEGORY
+    max_weight = -1
+
+    # Weights: Specificity increases weight
+    for keyword, category, subcategory in KEYWORD_MAP:
+        weight = len(keyword) # Simple weight: longer keywords are usually more specific
+        if keyword in signal:
+            if weight > max_weight:
+                max_weight = weight
+                best_cat, best_sub = category, subcategory
+
+    return best_cat, best_sub
+
+
+# ══════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════
 def main():
-    # Load seen hashes
+    start_time = datetime.now()
+    ai_ready   = USE_AI and bool(GEMINI_API_KEY)
+
+    log.info("═" * 60)
+    log.info("YARA Organizer (Optimized)")
+    log.info(f"  Rules file   : {RULES_FILE}")
+    log.info(f"  AI engine    : {'Gemini (Batch Mode)' if ai_ready else 'OFF'}")
+    log.info("═" * 60)
+
+    # Load databases
     seen_hashes = {}
     if os.path.exists(HASH_DB):
-        with open(HASH_DB, "r") as f:
-            seen_hashes = json.load(f)
+        with open(HASH_DB) as f: seen_hashes = json.load(f)
+    path_mapping = {}
+    if os.path.exists(PATH_MAPPING):
+        with open(PATH_MAPPING) as f: path_mapping = json.load(f)
+    ai_cache = {}
+    if os.path.exists(AI_CACHE_FILE):
+        with open(AI_CACHE_FILE) as f: ai_cache = json.load(f)
 
-    # STEP 1: Sync all repos first
+    # Step 1: Sync repos
     repo_info = sync_repos()
+    if not repo_info: return
+
+    # Step 2: Discovery Pass (Find what's new/changed)
+    stats = dict(processed=0, updated=0, skipped_dup=0, skipped_invalid=0,
+                 errors=0, ai_calls=0, kw_fallback=0, deleted=0)
     
-    # STEP 2: Process rules
-    new_files_count = 0
-    print("Processing YARA rules...")
+    seen_in_this_run = set()
+    to_classify = [] # List of (id, header, file_path, file_hash, repo_key)
+    item_id_counter = 0
+
+    log.info("Discovery Pass: Analyzing source repositories...")
     for repo_name, repo_root in repo_info:
         for root, _, files in os.walk(repo_root):
-            for file in files:
-                if file.endswith(".yar") or file.endswith(".yara"):
-                    file_path = Path(root) / file
-                    try:
-                        file_hash = get_md5(file_path)
-                        if file_hash in seen_hashes and Path(seen_hashes[file_hash]).exists():
-                            continue 
-                        
-                        cat, sub = get_category_info(file_path, repo_root)
-                        target_dir = Path(OUTPUT_DIR) / cat / sub
-                        target_dir.mkdir(parents=True, exist_ok=True)
-                        
-                        target_file = target_dir / file
-                        if target_file.exists():
-                            if get_md5(target_file) == file_hash:
+            for filename in files:
+                if not (filename.endswith(".yar") or filename.endswith(".yara")): continue
+                
+                file_path = Path(root) / filename
+                repo_key = str(file_path.relative_to(SOURCE_DIR)).replace("\\", "/")
+                seen_in_this_run.add(repo_key)
+
+                try:
+                    file_hash = get_md5(file_path)
+
+                    # Check for updates or duplicate source paths
+                    if repo_key in path_mapping:
+                        old_info = path_mapping[repo_key]
+                        if old_info.get("md5") == file_hash:
+                            if Path(old_info.get("organized_path", "")).exists():
+                                stats["skipped_dup"] += 1
                                 continue
-                            target_file = target_dir / f"{target_file.stem}_{file_hash[:8]}{target_file.suffix}"
+                        else:
+                            # Content changed - clean up old organized file
+                            old_dest = Path(old_info.get("organized_path", ""))
+                            is_shared = any(k != repo_key and v.get("organized_path") == old_info.get("organized_path") for k, v in path_mapping.items())
+                            if old_dest.exists() and not is_shared:
+                                old_dest.unlink()
+                            if old_info.get("md5") in seen_hashes and not is_shared:
+                                del seen_hashes[old_info["md5"]]
 
-                        shutil.copy2(file_path, target_file)
-                        new_files_count += 1
-                        seen_hashes[file_hash] = target_file.as_posix()
-                    except Exception as e:
-                        print(f"Error processing {file_path}: {e}")
+                    # Check global deduplication
+                    if file_hash in seen_hashes and Path(seen_hashes[file_hash]).exists():
+                        path_mapping[repo_key] = {"md5": file_hash, "organized_path": seen_hashes[file_hash]}
+                        stats["skipped_dup"] += 1
+                        continue
 
-    # STEP 3: Cleanup unauthorized folders (Purge)
-    print("Cleaning up unauthorized category folders...")
-    if os.path.exists(OUTPUT_DIR):
-        for item in os.listdir(OUTPUT_DIR):
-            item_path = os.path.join(OUTPUT_DIR, item)
-            if os.path.isdir(item_path) and item.lower() not in CATEGORIES:
-                print(f"Removing unauthorized category: {item}")
-                shutil.rmtree(item_path)
+                    # New rule discovery
+                    is_valid, _ = validate_yara(file_path)
+                    if not is_valid:
+                        stats["skipped_invalid"] += 1
+                        continue
 
-    # STEP 4: Save database and mapping
-    with open(HASH_DB, "w") as f:
-        json.dump(seen_hashes, f, indent=4)
+                    header = extract_yara_header(file_path)
+                    to_classify.append((item_id_counter, header, file_path, file_hash, repo_key))
+                    item_id_counter += 1
 
-    print("Updating mapping indexes...")
-    final_structure = {}
-    path_structure = {}
-    for cat_dir in sorted(Path(OUTPUT_DIR).iterdir()):
-        if cat_dir.is_dir() and cat_dir.name in CATEGORIES:
-            cat_name = cat_dir.name
-            final_structure[cat_name] = {}
-            path_structure[cat_name] = {}
-            for sub_dir in sorted(cat_dir.iterdir()):
-                if sub_dir.is_dir():
-                    sub_name = sub_dir.name
-                    files = sorted(list(sub_dir.glob("*.yar*")))
-                    if files:
-                        final_structure[cat_name][sub_name] = [f.name for f in files]
-                        path_structure[cat_name][sub_name] = [f.as_posix() for f in files]
+                except Exception as e:
+                    log.error(f"Error during discovery of {file_path}: {e}")
+                    stats["errors"] += 1
 
-    with open(MAPPING_JSON, "w") as f:
-        json.dump(final_structure, f, indent=4)
-    with open(PATH_MAPPING_JSON, "w") as f:
-        json.dump(path_structure, f, indent=4)
+    # Step 3: Categorization Pass (Batch AI)
+    log.info(f"Categorization Pass: Classifying {len(to_classify)} rules...")
+    ai_results = {}
+    if ai_ready and to_classify:
+        headers_only = [(item[0], item[1]) for item in to_classify if item[1]]
+        ai_results = batch_ai_categorize(headers_only, ai_cache)
+        stats["ai_calls"] = len(ai_results)
 
-    # STEP 5: Generate Path Indexes
-    print("Generating path indexes...")
-    with open(ALL_RULES_CSV, "w") as csv_f, open(ALL_PATHS_TXT, "w") as txt_f:
-        csv_f.write('"Name","Length","FullName"\n')
-        for root, _, files in os.walk(OUTPUT_DIR):
-            for file in files:
-                if file.endswith(".yar") or file.endswith(".yara"):
-                    file_path = Path(root) / file
-                    size = file_path.stat().st_size
-                    # Write to CSV
-                    csv_f.write(f'"{file}","{size}","{file_path.absolute().as_posix()}"\n')
-                    # Write to TXT
-                    txt_f.write(f"{file_path.absolute().as_posix()}\n")
+    # Step 4: Organization Pass (Final Copy)
+    log.info("Organization Pass: Sorting files...")
+    for item_id, header, file_path, file_hash, repo_key in to_classify:
+        try:
+            res = ai_results.get(item_id)
+            if not res:
+                category, subcategory = keyword_categorize(file_path, SOURCE_DIR)
+                stats["kw_fallback"] += 1
+            else:
+                category, subcategory = res["category"], res["subcategory"]
 
-    print(f"Sync complete. Added {new_files_count} new unique rules.")
+            dest = safe_copy(file_path, Path(OUTPUT_DIR) / category / subcategory, file_hash)
+            dest_posix = dest.as_posix()
+            seen_hashes[file_hash] = dest_posix
+            path_mapping[repo_key] = {"md5": file_hash, "organized_path": dest_posix}
+            stats["processed"] += 1
+        except Exception as e:
+            log.error(f"Error organizing {file_path}: {e}")
+            stats["errors"] += 1
+
+    # Step 5: Deletion Pass
+    log.info("Deletion Pass: Cleaning up removed rules...")
+    for repo_key in list(path_mapping.keys()):
+        if repo_key not in seen_in_this_run:
+            info = path_mapping[repo_key]
+            old_dest = Path(info.get("organized_path", ""))
+            is_still_needed = any(k != repo_key and k in seen_in_this_run and v.get("organized_path") == info.get("organized_path") for k, v in path_mapping.items())
+            if old_dest.exists() and not is_still_needed:
+                old_dest.unlink()
+                if info.get("md5") in seen_hashes: del seen_hashes[info["md5"]]
+            del path_mapping[repo_key]
+            stats["deleted"] += 1
+
+    purge_unknown_folders()
+
+    # Save State
+    with open(HASH_DB, "w") as f: json.dump(seen_hashes, f, indent=4)
+    with open(PATH_MAPPING, "w") as f: json.dump(path_mapping, f, indent=4)
+    with open(AI_CACHE_FILE, "w") as f: json.dump(ai_cache, f, indent=4)
+    with open(MAPPING_JSON, "w") as f: json.dump(build_mapping(), f, indent=4)
+
+    elapsed = (datetime.now() - start_time).total_seconds()
+    log.info("═" * 60)
+    log.info(f"Finished in {elapsed:.1f}s")
+    log.info(f"  Rules processed    : {stats['processed']}")
+    log.info(f"  Rules deleted      : {stats['deleted']}")
+    log.info(f"  Duplicates skipped : {stats['skipped_dup']}")
+    log.info(f"  AI categorization  : {stats['ai_calls']}")
+    log.info(f"  Keyword fallback   : {stats['kw_fallback']}")
+    log.info("═" * 60)
+
 
 if __name__ == "__main__":
     main()

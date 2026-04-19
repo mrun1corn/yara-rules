@@ -1,0 +1,64 @@
+{
+    "defaults": {
+        "category": "malware",
+        "subcategory": "Shellcode"
+    },
+    "taxonomy": {
+        "sql_injection": {
+            "subcategories": ["SQL_Brute_Force"],
+            "keywords": ["sql", "sqli", "union select", "drop table"]
+        },
+        "scripting_attacks": {
+            "subcategories": ["PowerShell_Abuse", "Shellcode", "Injection_Techniques"],
+            "keywords": ["powershell", "ps1", "shellcode", "inject", "hollowing", "exploit", "cve"]
+        },
+        "brute_force": {
+            "subcategories": ["SQL_Brute_Force"],
+            "keywords": ["brute", "bruteforce", "password spray", "hydra"]
+        },
+        "credential_theft": {
+            "subcategories": ["Infostealers"],
+            "keywords": ["credential", "mimikatz", "lsass", "sam dump", "hashdump"]
+        },
+        "phishing": {
+            "subcategories": ["Phishing_Lures"],
+            "keywords": ["phish", "lure", "spear", "pretexting"]
+        },
+        "behavioral": {
+            "subcategories": ["Evasion_Sandbox"],
+            "keywords": ["sandbox", "evasion", "antidebug", "anti_vm", "vm detect"]
+        },
+        "rootkit": {
+            "subcategories": ["Rootkits_Kernel"],
+            "keywords": ["rootkit", "kernel", "bootkit", "hypervisor", "ring0"]
+        },
+        "malware": {
+            "subcategories": ["Downloaders_Droppers", "CoinMiner", "Macros", "Shellcode"],
+            "keywords": ["dropper", "downloader", "loader", "coinminer", "cryptominer", "miner", "macro", "vba", "xlm"]
+        },
+        "trojans": {
+            "subcategories": ["Banking_Trojans", "RATs"],
+            "keywords": ["trojan", "banking", "banker", "rat", "remote_access", "backdoor"]
+        },
+        "ransomware": {
+            "subcategories": ["Crypto_Ransomware"],
+            "keywords": ["ransom", "locker", "encrypt", "crypto_ransom", "wannacry", "ryuk"]
+        },
+        "spyware": {
+            "subcategories": ["Infostealers", "Keyloggers"],
+            "keywords": ["spyware", "infostealer", "stealer", "keylog", "keylogger"]
+        },
+        "worms": {
+            "subcategories": ["Persistence_Methods"],
+            "keywords": ["worm", "self_replicate", "spreader", "propagat"]
+        },
+        "autorun": {
+            "subcategories": ["Persistence_Methods"],
+            "keywords": ["autorun", "startup", "registry run", "scheduled task", "persist"]
+        },
+        "security": {
+            "subcategories": ["AMSI_Bypass"],
+            "keywords": ["amsi", "bypass", "av bypass", "edr bypass", "applocker"]
+        }
+    }
+}
