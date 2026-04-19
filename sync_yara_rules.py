@@ -202,6 +202,106 @@ def validate_yara(file_path):
 
 
 # ══════════════════════════════════════════════
+#  GIT SYNC
+# ══════════════════════════════════════════════
+def sync_repos():
+    os.makedirs(SOURCE_DIR, exist_ok=True)
+    repos, results, failed = get_repos(), [], []
+
+    for repo_url in repos:
+        repo_name = repo_url.rstrip("/").split("/")[-1]
+        target    = Path(SOURCE_DIR) / repo_name
+        try:
+            if target.exists():
+                log.info(f"Updating  {repo_name} ...")
+                proc = subprocess.run(
+                    ["git", "-C", str(target), "pull"],
+                    capture_output=True, text=True, timeout=120
+                )
+            else:
+                log.info(f"Cloning   {repo_name} ...")
+                proc = subprocess.run(
+                    ["git", "clone", "--depth", "1", repo_url, str(target)],
+                    capture_output=True, text=True, timeout=300
+                )
+            if proc.returncode != 0:
+                log.error(f"Git error for {repo_name}:\n{proc.stderr.strip()}")
+                failed.append(repo_name)
+            else:
+                results.append((repo_name, target))
+        except subprocess.TimeoutExpired:
+            log.error(f"Git timed out for {repo_name}")
+            failed.append(repo_name)
+        except FileNotFoundError:
+            log.error("'git' not installed or not in PATH.")
+            break
+
+    if failed:
+        log.warning(f"Failed repos: {', '.join(failed)}")
+    return results
+
+
+# ══════════════════════════════════════════════
+#  SAFE COPY
+# ══════════════════════════════════════════════
+def safe_copy(src, target_dir, file_hash):
+    target_dir.mkdir(parents=True, exist_ok=True)
+    dest = target_dir / src.name
+    if dest.exists():
+        if get_md5(dest) == file_hash:
+            return dest
+        dest = target_dir / f"{src.stem}_{file_hash[:8]}{src.suffix}"
+    shutil.copy2(src, dest)
+    return dest
+
+
+# ══════════════════════════════════════════════
+#  PURGE UNAUTHORIZED FOLDERS
+# ══════════════════════════════════════════════
+def purge_unknown_folders():
+    """
+    Removes any folder inside OUTPUT_DIR whose name is not a
+    valid category in the taxonomy, or whose subcategory folders
+    are not valid for that category.
+    """
+    if not os.path.exists(OUTPUT_DIR):
+        return
+    for cat_item in os.listdir(OUTPUT_DIR):
+        cat_path = Path(OUTPUT_DIR) / cat_item
+        if not cat_path.is_dir():
+            continue
+        if cat_item not in VALID_CATEGORIES:
+            log.info(f"  Removing unknown category folder: {cat_item}/")
+            shutil.rmtree(cat_path)
+            continue
+        # Also purge subcategory folders that don't belong to this category
+        allowed_subs = set(TAXONOMY[cat_item].get("subcategories", []))
+        for sub_item in os.listdir(cat_path):
+            sub_path = cat_path / sub_item
+            if sub_path.is_dir() and sub_item not in allowed_subs:
+                log.info(f"  Removing misplaced subfolder: {cat_item}/{sub_item}/")
+                shutil.rmtree(sub_path)
+
+
+# ══════════════════════════════════════════════
+#  MAPPING INDEX
+# ══════════════════════════════════════════════
+def build_mapping():
+    """Reflects the actual output folder structure into yara_structure_mapping.json."""
+    structure = {}
+    for cat_dir in sorted(Path(OUTPUT_DIR).iterdir()):
+        if not cat_dir.is_dir():
+            continue
+        structure[cat_dir.name] = {}
+        for sub_dir in sorted(cat_dir.iterdir()):
+            if sub_dir.is_dir():
+                files = sorted(f.name for f in sub_dir.glob("*.yar*"))
+                if files:
+                    structure[cat_dir.name][sub_dir.name] = files
+    return structure
+
+
+# ══════════════════════════════════════════════
 #  GEMINI API CALL  (pure stdlib — no SDK)
 # ══════════════════════════════════════════════
 def call_gemini(prompt):
@@ -333,7 +433,7 @@ Respond ONLY with a JSON array of objects.
 # ══════════════════════════════════════════════
 #  FALLBACK: KEYWORD CATEGORIZATION (Weighted)
 # ══════════════════════════════════════════════
-def keyword_categorize(file_path, repo_root):
+def keyword_categorize(file_path):
     header   = extract_yara_header(file_path)
     path_str = str(file_path).lower()
     signal   = f"{path_str} {header.lower()}"
@@ -451,7 +551,7 @@ def main():
         try:
             res = ai_results.get(item_id)
             if not res:
-                category, subcategory = keyword_categorize(file_path, SOURCE_DIR)
+                category, subcategory = keyword_categorize(file_path)
                 stats["kw_fallback"] += 1
             else:
                 category, subcategory = res["category"], res["subcategory"]
